@@ -591,12 +591,16 @@ def cmd_render(a):
     orient = "竖屏" if aspect == "9:16" else "横屏"
     kind = sp.get("style_kind", "3D国漫动画短剧")
     texture = sp.get("style_texture", "UE5引擎电影级实时渲染质感")
+    prefix = str(sp.get("prefix") or "").strip().rstrip("，,。")  # 用户的生图/生视频风格前缀，放在每段和每条参考图提示词最前面
     white = set(sp.get("whitelist", []))
     std_cons = sp.get("std_constraints", ["不生成任何字幕或说明文字。", "参考图中的文字、标签、三视图边框不得出现在画面中。"])
     warns, out = [], []
     t_global = float(sp.get("start", 0))
     all_lines, filled_lines, adapt_lines = [], [], []
     design = (sp.get("design") or "").strip()
+    if prefix and design:  # 每条参考图提示词的第一句就是风格前缀，绘图模型最看重开头
+        design = re.sub(r"^(## [^\n]*提示词[^\n]*\n)(?!" + re.escape(prefix) + ")",
+                        lambda m: m.group(1) + prefix + "，", design, flags=re.M)
     overview = []  # (分镜号, 起, 止, 时长, 镜头数, 参考图, 剧情)
     filled_chars = orig_chars = 0
     for n, sg in enumerate(sp["segments"], 1):
@@ -621,7 +625,7 @@ def cmd_render(a):
                 warns.append(f"分镜{n}: 参考图「{r}」在本段画面描述里没用到（多放图会被模型硬塞进画面）")
         o = [f"# 分镜{n}｜预计时长：{_fmt(L)}秒｜全片时间：{t_global:g}—{t_global + L:g}秒", "",
              f"**本段参考图：{'、'.join(refs)}**", f"**镜头数量：{len(shots)}个**", f"**剧情范围：**{sg['range']}", "",
-             f"生成一段{_fmt(L)}秒的高质量{aspect}{orient}{kind}视频，{texture}，超清画质，稳定人物建模、服装、材质和场景资产，"
+             (f"{prefix}。" if prefix else "") + f"生成一段{_fmt(L)}秒的高质量{aspect}{orient}{kind}视频，{texture}，超清画质，稳定人物建模、服装、材质和场景资产，"
              f"电影级构图与符合当前剧情、人物关系和情绪的自然光影" + ("" if n == 1 and not sp.get("start") else "，保持人物服装和场景与上一段连续") + "。",
              "", "**全局设定：**", f"场景：{sg['scene']}", ""]
         pos = sg.get("positions", {})
