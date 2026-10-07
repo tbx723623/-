@@ -313,12 +313,29 @@ def cmd_analyze(a):
     analyze_subs_and_write(video, out, info, a.band, shots, sec_sheets, shot_sheets, a.full)
 
 
+def grab(video, t, tw):
+    """取 t 秒处一帧，缩放到宽 tw。"""
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{max(0, t):.2f}", "-i", video,
+                        "-frames:v", "1", "-vf", f"scale={tw}:-2", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                       capture_output=True)
+    hh = len(p.stdout) // (tw * 3)
+    if hh <= 0:
+        return None
+    return np.frombuffer(p.stdout[: tw * hh * 3], np.uint8).reshape(hh, tw, 3)
+
+
 def analyze_visual(video, out, info, scene, full=False):
     dur = info["duration"]
     cuts = scene_cuts(video, scene)
     bounds = [0.0] + [c for c in cuts if 0.2 < c < dur - 0.2] + [dur]
     shots = [{"id": i + 1, "start": round(bounds[i], 2), "end": round(bounds[i + 1], 2)} for i in range(len(bounds) - 1)]
-    print(f"[2/6] 镜头切点: {len(shots)} 个镜头")
+    # 疑似切点：低阈值(0.08)才触发、离正式切点超过 0.5 秒的位置。
+    # 同场景反打、换机位、溶解转场常被正式阈值漏掉；人物快速运动也会触发，所以只标"疑似"，由看图确认。
+    lo = [c for c in scene_cuts(video, 0.08) if 0.3 < c < dur - 0.3 and all(abs(c - b) > 0.5 for b in bounds)]
+    for s in shots:
+        s["suspect"] = [round(c, 2) for c in lo if s["start"] < c < s["end"]]
+    nsus = sum(len(s["suspect"]) for s in shots)
+    print(f"[2/6] 镜头切点: {len(shots)} 个镜头，另有疑似切点 {nsus} 处（拼图里标 cut? 的前后两帧）")
 
     # 1fps 时间码拼图：只有 --full 才生成（省钱模式下，有疑问的时段用 zoom 单独看）
     sec_sheets = []
@@ -330,27 +347,27 @@ def analyze_visual(video, out, info, scene, full=False):
     else:
         print("[3/6] 省钱模式：不生成每秒拼图（需要时用 zoom 看具体时段，或加 --full）")
 
-    # 镜头关键帧拼图：省钱模式下短于 3 秒的镜头只取中间一帧，长镜头取 25%/75% 两帧看运镜
+    # 镜头关键帧拼图：短于 3 秒取中间一帧；3–6 秒取前段 a、后段 b；6 秒以上每约 3 秒一帧（最多 6 帧），
+    # 缓推、跟拍、长镜头里的调度变化不用再 zoom；疑似切点另取前后各一帧并排
     tw = 480 if full else 384
     shot_imgs = []
     for s in shots:
-        long_shot = full or (s["end"] - s["start"]) >= 3.0
-        picks = ((0.25, "a"), (0.75, "b")) if long_shot else ((0.5, ""),)
-        for q, tag in picks:
-            t = s["start"] + (s["end"] - s["start"]) * q
-            p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", video,
-                                "-frames:v", "1", "-vf", f"scale={tw}:-2", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
-                               capture_output=True)
-            hh = len(p.stdout) // (tw * 3)
-            if hh <= 0:
-                continue
-            im = np.frombuffer(p.stdout[: tw * hh * 3], np.uint8).reshape(hh, tw, 3)
-            shot_imgs.append(label(im, f"S{s['id']:02d}{tag} {s['start']:.1f}-{s['end']:.1f}s"))
+        d = s["end"] - s["start"]
+        n = 2 if full else (1 if d < 3.0 else 2 if d < 6.0 else min(6, int(math.ceil(d / 3.0))))
+        tags = "abcdef"
+        picks = [(0.5, "")] if n == 1 else [((k + 0.5) / n if n > 2 else (0.25, 0.75)[k], tags[k]) for k in range(n)]
+        items = [(s["start"] + d * q, f"S{s['id']:02d}{tag} {s['start']:.1f}-{s['end']:.1f}s") for q, tag in picks]
+        for c in s["suspect"]:
+            items += [(c - 0.3, f"S{s['id']:02d} cut? {c:.1f} <"), (c + 0.3, f"S{s['id']:02d} cut? {c:.1f} >")]
+        for t, lab in sorted(items, key=lambda x: x[0]):
+            im = grab(video, t, tw)
+            if im is not None:
+                shot_imgs.append(label(im, lab))
     h0 = shot_imgs[0].shape[0]
     shot_imgs = [cv2.resize(i, (tw, h0)) if i.shape[0] != h0 else i for i in shot_imgs]
     cols, rows = (4, 3) if full else (5, 4)
     shot_sheets = tile(shot_imgs, cols, os.path.join(out, "shots"), rows=rows)
-    print(f"[4/6] 镜头拼图: {len(shot_sheets)} 张 (长镜头 a=前段 b=后段，短镜头一帧)")
+    print(f"[4/6] 镜头拼图: {len(shot_sheets)} 张（a/b/c…=镜头内先后几帧；cut? <>=疑似切点前后，画面构图突变就是漏掉的切点）")
     return shots, sec_sheets, shot_sheets
 
 
@@ -439,10 +456,10 @@ def analyze_subs_and_write(video, out, info, band_arg, shots, sec_sheets, shot_s
     with open(os.path.join(out, "analysis.json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
     lines = [f"# 时间线  时长 {dur:.1f}s  {W}x{H}（{aspect}）  {info['fps']}fps  镜头 {len(shots)}  字幕段 {len(subs)}", "",
-             "| 镜头 | 时间 | 时长 | 重叠字幕(#编号 时间 音高提示) |", "|---|---|---|---|"]
+             "| 镜头 | 时间 | 时长 | 疑似切点 | 重叠字幕(#编号 时间 音高提示) |", "|---|---|---|---|---|"]
     for s in shots:
         ov = [f"#{u['id']} {u['start']:.1f}-{u['end']:.1f} {u['voice_hint']}{u['f0'] or ''}" for u in subs if s["id"] in u["shots"]]
-        lines.append(f"| S{s['id']:02d} | {s['start']:.2f}-{s['end']:.2f} | {s['end'] - s['start']:.1f}s | {'; '.join(ov)} |")
+        lines.append(f"| S{s['id']:02d} | {s['start']:.2f}-{s['end']:.2f} | {s['end'] - s['start']:.1f}s | {' '.join(str(c) for c in s.get('suspect', []))} | {'; '.join(ov)} |")
     with open(os.path.join(out, "timeline.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     print(f"[6/6] 输出: {out}/analysis.json, timeline.md")
