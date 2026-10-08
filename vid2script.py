@@ -589,12 +589,16 @@ def cmd_render(a):
     seg_len = float(sp.get("seg_len", 15))
     aspect = sp.get("aspect", "16:9")
     orient = "竖屏" if aspect == "9:16" else "横屏"
-    kind = sp.get("style_kind", "3D国漫动画短剧")
+    kind = sp.get("style_kind", "3D国漫动画电影")
+    if "短剧" in kind:  # 训练数据里"短剧"几乎都烧录字幕，写进风格会诱导模型加字幕
+        warns_pre = [f"style_kind 里有\"短剧\"（{kind}）：容易让模型自动加字幕，建议改成\"动画电影\"\"动画\""]
+    else:
+        warns_pre = []
     texture = sp.get("style_texture", "UE5引擎电影级实时渲染质感")
     prefix = str(sp.get("prefix") or "").strip().rstrip("，,。")  # 用户的生图/生视频风格前缀，放在每段和每条参考图提示词最前面
     white = set(sp.get("whitelist", []))
     std_cons = sp.get("std_constraints", ["不生成任何字幕或说明文字。", "参考图中的文字、标签、三视图边框不得出现在画面中。"])
-    warns, out = [], []
+    warns, out = list(warns_pre), []
     t_global = float(sp.get("start", 0))
     all_lines, filled_lines, adapt_lines = [], [], []
     design = (sp.get("design") or "").strip()
@@ -625,7 +629,7 @@ def cmd_render(a):
                 warns.append(f"分镜{n}: 参考图「{r}」在本段画面描述里没用到（多放图会被模型硬塞进画面）")
         o = [f"# 分镜{n}｜预计时长：{_fmt(L)}秒｜全片时间：{t_global:g}—{t_global + L:g}秒", "",
              f"**本段参考图：{'、'.join(refs)}**", f"**镜头数量：{len(shots)}个**", f"**剧情范围：**{sg['range']}", "",
-             (f"{prefix}。" if prefix else "") + f"生成一段{_fmt(L)}秒的高质量{aspect}{orient}{kind}视频，{texture}，超清画质，稳定人物建模、服装、材质和场景资产，"
+             (f"{prefix}，" if prefix else "") + "画面纯净，全程无任何字幕、文字和水印。" + f"生成一段{_fmt(L)}秒的高质量{aspect}{orient}{kind}视频，{texture}，超清画质，稳定人物建模、服装、材质和场景资产，"
              f"电影级构图与符合当前剧情、人物关系和情绪的自然光影" + ("" if n == 1 and not sp.get("start") else "，保持人物服装和场景与上一段连续") + "。",
              "", "**全局设定：**", f"场景：{sg['scene']}", ""]
         pos = sg.get("positions", {})
@@ -677,7 +681,7 @@ def cmd_render(a):
                 who, vk, txt, why, orig = _line(ln)
                 filled = bool(why)  # 补写依据：原片读不出来、AI 按剧情补的台词
                 tag = (vk if "（" in vk else f"（{vk}）") if vk else ""  # 自带括号的类型（如 手机打字（画外音朗读，嘴不动））直接接在名字后
-                o += [f"对白/旁白：{who}{tag}：“{txt}”", ""]  # 剧本里不加标记，免得模型把标记当文字生成
+                o += [f"台词（只出声音，不显示成字幕）：{who}{tag}：“{txt}”", ""]  # 剧本里不加标记，免得模型把标记当文字生成
                 nchar += len(_norm(txt))
                 if filled:
                     filled_lines.append((n, k, t, who, txt, str(why)))
