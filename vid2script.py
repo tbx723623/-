@@ -943,6 +943,20 @@ def cmd_render(a):
     if prefix and design:  # 每条参考图提示词的第一句就是风格前缀，绘图模型最看重开头
         design = re.sub(r"^(## [^\n]*提示词[^\n]*\n)(?!" + re.escape(prefix) + ")",
                         lambda m: m.group(1) + prefix + "，", design, flags=re.M)
+    # 参考图提示词逐条检查：图上的字会进视频变乱码；衣服不写清会被模型自己加字母徽章；太长绘图模型抓不住重点
+    for head, body in re.findall(r"^## ([^\n]*提示词)[^\n]*\n(.*?)(?=^## |\Z)", design, flags=re.M | re.S):
+        name, body = head.split("｜")[0].strip(), body.strip()
+        if not re.search(r"无(任何)?文字", body):
+            warns.append(f"参考图「{name}」：提示词没写\"画面无任何文字、标签和标注\"（图上的正面/侧面/背面标签、名字会进视频变乱码）")
+        if "人物" in head:
+            if "无字母" not in body:
+                warns.append(f"参考图「{name}」：没写服装\"无字母、无徽章、无印花\"（模型会在衣服上自己加字母和徽章）")
+            if len(body) > 720:
+                warns.append(f"参考图「{name}」：提示词 {len(body)} 字，超过约 650 字绘图模型抓不住重点，删掉次要细节")
+            if re.search(r"短裙|超短|大腿中部|迷你裙", body) and not re.search(r"打底|防走光", body):
+                warns.append(f"参考图「{name}」：有短裙但没写\"内置防走光打底裤\"（平台审核容易拦）")
+        elif "场景" in head and "无人物" not in body:
+            warns.append(f"参考图「{name}」：场景图没写\"无人物\"（场景图里出现的人会被模型当成角色）")
     overview = []  # (分镜号, 起, 止, 时长, 镜头数, 参考图, 剧情)
     filled_chars = orig_chars = 0
     for n, sg in enumerate(sp["segments"], 1):
