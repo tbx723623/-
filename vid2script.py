@@ -583,6 +583,58 @@ def _line(ln):
     return ln[0], "", ln[1], "", ""
 
 
+# ---------- 起名：每次随机给候选，避开用过的名字和 AI 爱用的烂大街名字 ----------
+SURN = list("闻岑晏祁阮钟庄戚柏简舒季黎虞骆卓梁夏纪霍邵方孟薛喻乔段俞盛甘魏殷姚凌封景尹向应严祝符郁关迟冉席卫车鹿商程秦许唐姜蔺芮岳邬颜樊滕谭")
+CLICHE_SURN = set("陆顾沈江林苏宋温傅裴谢萧楚白叶慕墨")  # AI 言情里出现太多，主要角色不用
+MALE = list("昀衡朔骁弈澄岐越曜珂凛钧霁野舟礼恪栩谦宥骞崇峻渊承序策衍晟昭煦遂瞻峥遥庭朗稷川砺珩熠")
+FEMALE = list("棠鸢栀苒芷绾黛漪璃晚枝蘅菀筠葭绮稚盈桑杳珞翎汀沅莺芊茉蕤霏姝婳嫣蓁薇昙绯萤")
+NEUTRAL = list("青微怀星岚言今时禾樾鹤岫")
+CLICHE = {"叙白", "知夏", "砚之", "时雨", "屿川", "以宁", "京泽", "梦瑶", "念", "子墨", "沐辰", "北辰", "景深", "慕白", "墨白",
+          "清欢", "南乔", "星辞", "宴辞", "晏辞", "怀瑾", "思远", "若曦", "安然", "一诺", "寒", "辰", "瑶", "夜", "澈", "宸"}
+
+
+def _used_file():
+    for d in (os.path.dirname(os.path.abspath(__file__)), "/tmp/v2s"):
+        f = os.path.join(d, "used_names.txt")
+        if os.path.exists(f):
+            return f
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "used_names.txt")
+
+
+def _used_names():
+    try:
+        return {w for w in re.split(r"[\s,，、]+", open(_used_file(), encoding="utf-8").read()) if w and not w.startswith("#")}
+    except OSError:
+        return set()
+
+
+def cmd_names(a):
+    if a.add:
+        f = _used_file()
+        old = _used_names()
+        new = [n for n in a.add if n not in old]
+        with open(f, "a", encoding="utf-8") as fh:
+            for n in new:
+                fh.write(n + "\n")
+        print(f"已记入 {f}：{'、'.join(new) or '（都已在表里）'}")
+        return
+    import random
+    rnd = random.SystemRandom()
+    used = _used_names()
+    used_given = {u[1:] for u in used if len(u) >= 2} | {u[-1] for u in used}
+    for label, pool in (("男", MALE), ("女", FEMALE)):
+        out = set()
+        while len(out) < a.n:
+            sn = rnd.choice(SURN)
+            k = rnd.choice([1, 2, 2, 2])
+            g = "".join(rnd.sample(pool + NEUTRAL, k))
+            nm = sn + g
+            if sn in g or g in CLICHE or any(c in CLICHE for c in g) or nm in used or g in used_given:
+                continue
+            out.add(nm)
+        print(f"{label}：" + "  ".join(sorted(out)))
+    print(f"（已避开用过的 {len(used)} 个名字；挑合适的用，选定后运行 names --add 名字... 记进用过的名单）")
+
 def cmd_render(a):
     sp = _load_spec(a.spec)
     chars = sp.get("characters", {})
@@ -727,6 +779,13 @@ def cmd_render(a):
         text += "\n\n---\n\n# 全片统一生成规则\n\n" + sp["global_rules"].strip()
     open(a.out, "w", encoding="utf-8").write(text + "\n")
     # 改编检查：原片的人名、地名、标志性道具不能残留在剧本里
+    if sp.get("adapt"):
+        used = _used_names()
+        for nm in list(chars) + list((sp.get("voices") or {}).keys()):
+            if nm in used:
+                warns.append(f"角色名「{nm}」以前的剧用过了，换一个（vid2script.py names 出候选）")
+            elif len(nm) >= 2 and (nm[1:] in CLICHE or (nm[0] in CLICHE_SURN and len(nm) >= 3)):
+                warns.append(f"角色名「{nm}」是 AI 常用的烂大街名字，容易和别的剧撞，建议换（vid2script.py names 出候选）")
     rename = sp.get("rename") or {}
     for old, new in rename.items():
         if old and old in text:
@@ -799,6 +858,9 @@ def main():
     p = sp.add_parser("asr"); p.add_argument("video"); p.add_argument("out_dir")
     p.add_argument("--model", default="small"); p.add_argument("--lang", default="zh")
     p.set_defaults(f=cmd_asr)
+    p = sp.add_parser("names", help="随机给一批候选名字（避开用过的）；--add 把选定的名字记进用过的名单")
+    p.add_argument("-n", type=int, default=12); p.add_argument("--add", nargs="*")
+    p.set_defaults(f=cmd_names)
     p = sp.add_parser("render"); p.add_argument("spec", help="剧本数据 spec.yaml / spec.json"); p.add_argument("out", help="输出 script.md")
     p.set_defaults(f=cmd_render)
     a = ap.parse_args()
