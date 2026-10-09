@@ -932,7 +932,8 @@ def cmd_render(a):
     else:
         warns_pre = []
     texture = sp.get("style_texture", "UE5引擎电影级实时渲染质感")
-    prefix = str(sp.get("prefix") or "").strip().rstrip("，,。")  # 用户的生图/生视频风格前缀，放在每段和每条参考图提示词最前面
+    # 用户固定画风：没写 prefix 时默认用 3D国漫 + UE5电影级质感（放在每段和每条参考图提示词最前面）
+    prefix = str(sp.get("prefix") or "3D国漫 + UE5电影级质感").strip().rstrip("，,。")
     white = set(sp.get("whitelist", []))
     std_cons = sp.get("std_constraints", ["不生成任何字幕或说明文字。", "参考图中的文字、标签、三视图边框不得出现在画面中。"])
     warns, out = list(warns_pre), []
