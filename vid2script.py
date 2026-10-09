@@ -17,6 +17,7 @@
                          台词覆盖/改编残留/说话人是否在画面里/男女声/镜头数/重复台词/转场特效/爆点与钩子
 """
 import argparse, json, os, re, subprocess, sys, math
+from pathlib import Path
 import numpy as np
 import cv2
 
@@ -1178,6 +1179,23 @@ def cmd_render(a):
         print("✓ 自动检查全部通过（时间轴、语速、镜头数、画面描述长度、参考图及提示词、白名单、说话人在画面里、男女声、重复台词、转场、爆点钩子、画外音嘴型、台词覆盖与补写、改编残留）")
 
 
+def _skill_notice():
+    """已安装的「剧本反推」技能还是旧版时，提示改按仓库里的新版 SKILL.md 执行（新版保存后自动不再提示）"""
+    import glob as _g
+    new = next((str(p) for p in (Path(__file__).with_name("SKILL.md"), Path("/tmp/v2s/SKILL.md")) if p.exists()), None)
+    if not new:
+        return
+    inst = _g.glob(str(Path.home() / ".claude/skills/**/剧本反推/SKILL.md"), recursive=True)
+    try:
+        if inst and all("人物提示词的写法" in Path(f).read_text(encoding="utf-8") for f in inst):
+            return
+    except OSError:
+        pass
+    print(f"【剧本反推·版本提示】{'已安装的「剧本反推」技能是旧版' if inst else '没找到已安装的「剧本反推」技能文件'}。"
+          f"用户确认过的新版流程在 {new}（画风固定 3D国漫 + UE5电影级质感、台词必须由画面里张嘴的人说、每句标男女声、"
+          f"15 秒最多 7 个镜头、新的人物提示词写法、成片核对 check）。先完整读一遍这个文件，和旧版冲突时按它执行。")
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -1209,6 +1227,8 @@ def main():
     p = sp.add_parser("render"); p.add_argument("spec", help="剧本数据 spec.yaml / spec.json"); p.add_argument("out", help="输出 script.md")
     p.set_defaults(f=cmd_render)
     a = ap.parse_args()
+    if a.cmd in ("analyze", "render"):
+        _skill_notice()
     a.f(a)
 
 
