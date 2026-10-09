@@ -601,11 +601,20 @@ def _used_file():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "used_names.txt")
 
 
-def _used_names():
+def _used_names(skip_title=None):
+    """used_names.txt 每行一个名字，可写成"名字|剧名"；skip_title=本剧剧名时，本剧自己登记过的名字不算撞名。"""
+    out = set()
     try:
-        return {w for w in re.split(r"[\s,，、]+", open(_used_file(), encoding="utf-8").read()) if w and not w.startswith("#")}
+        for line in open(_used_file(), encoding="utf-8"):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            nm, _, tt = line.partition("|")
+            if nm.strip() and not (skip_title and tt.strip() == skip_title):
+                out.add(nm.strip())
     except OSError:
-        return set()
+        pass
+    return out
 
 
 def cmd_names(a):
@@ -615,7 +624,7 @@ def cmd_names(a):
         new = [n for n in a.add if n not in old]
         with open(f, "a", encoding="utf-8") as fh:
             for n in new:
-                fh.write(n + "\n")
+                fh.write(n + (f"|{a.title}" if a.title else "") + "\n")
         print(f"已记入 {f}：{'、'.join(new) or '（都已在表里）'}")
         return
     import random
@@ -780,7 +789,7 @@ def cmd_render(a):
     open(a.out, "w", encoding="utf-8").write(text + "\n")
     # 改编检查：原片的人名、地名、标志性道具不能残留在剧本里
     if sp.get("adapt"):
-        used = _used_names()
+        used = _used_names(sp.get("title"))
         for nm in list(chars) + list((sp.get("voices") or {}).keys()):
             if nm in used:
                 warns.append(f"角色名「{nm}」以前的剧用过了，换一个（vid2script.py names 出候选）")
@@ -860,6 +869,7 @@ def main():
     p.set_defaults(f=cmd_asr)
     p = sp.add_parser("names", help="随机给一批候选名字（避开用过的）；--add 把选定的名字记进用过的名单")
     p.add_argument("-n", type=int, default=12); p.add_argument("--add", nargs="*")
+    p.add_argument("--title", default="", help="剧名；--add 时一起记下，本剧以后重新 render 不会把自己的名字当撞名")
     p.set_defaults(f=cmd_names)
     p = sp.add_parser("render"); p.add_argument("spec", help="剧本数据 spec.yaml / spec.json"); p.add_argument("out", help="输出 script.md")
     p.set_defaults(f=cmd_render)
