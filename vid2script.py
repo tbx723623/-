@@ -7,8 +7,14 @@
   zoom VIDEO START DUR OUT.png [--fps 4] [--crop x,y,w,h]
                          把某一小段放大成拼图，用于核对口型/动作/道具
   pitch VIDEO START END  单独测某一段的音高（带背景噪声扣除）
-  asr VIDEO OUTDIR       （可选）语音转写；环境装不上模型时会说明并退出
-  render SPEC OUT.md     把精简剧本数据展开成完整分镜格式（开头自动加总览，可带参考图提示词），并自动检查时间轴/语速/参考图/白名单/台词覆盖/改编残留
+  asr VIDEO OUTDIR [--cuts 0,2.5,...]
+                         语音转写（SenseVoice，首次自动下载约 230MB 模型）：每小句的起止时间、音高、男/女声、文字；
+                         --cuts 按镜头切开逐段转写（核对成片用）
+  check CLIP OUTDIR [--spec spec.yaml --seg N]
+                         成片核对：镜头切点 vs 剧本时长、逐镜头转写台词并判断男女声、对照剧本逐句打 ✓/✗、每秒 2 帧拼图
+  names                  出不撞名的候选名字；--add 登记已用名字
+  render SPEC OUT.md     把精简剧本数据展开成完整分镜格式（开头自动加总览，可带参考图提示词），并自动检查时间轴/语速/参考图/白名单/
+                         台词覆盖/改编残留/说话人是否在画面里/男女声/镜头数/重复台词/转场特效/爆点与钩子
 """
 import argparse, json, os, re, subprocess, sys, math
 import numpy as np
@@ -509,45 +515,297 @@ def cmd_pitch(a):
     print(f"{a.start}-{a.end}s  f0≈{f0:.0f}Hz  有声比例 {vr:.2f}  提示: {gender_hint(f0)} (男<165, 女>210, 中间不确定；有背景音乐时仅供参考)")
 
 
-def cmd_asr(a):
-    """语音转写（可选）。依次尝试 faster_whisper / whisper / funasr；都没有就说明原因退出。"""
-    wav = os.path.join(a.out_dir, "audio16k.wav")
-    os.makedirs(a.out_dir, exist_ok=True)
-    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", a.video, "-ac", "1", "-ar", "16000", wav])
-    segs = None
+# ---------- 语音识别：SenseVoice（sherpa-onnx 导出的 ONNX，直接用 onnxruntime 跑，不需要 sherpa-onnx 包） ----------
+# 实测（3 分钟带背景音乐的国漫短剧）：错字率 3.6%，30 秒跑完，逐句时间和字幕误差约 0.1 秒；
+# 对比 Paraformer-large 4.8%、SenseVoice 全精度 3.4%（体积大 4 倍，不划算）。
+SV_URL = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/"
+          "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17.tar.bz2")
+SV_ROOT = os.environ.get("V2S_ASR_DIR", "/tmp/asr")
+SR16 = 16000
+
+
+def _sv_dir(download=True):
+    import glob
+    hit = glob.glob(os.path.join(SV_ROOT, "*", "model.int8.onnx"))
+    if not hit and download:
+        os.makedirs(SV_ROOT, exist_ok=True)
+        print(f"首次使用：下载语音识别模型（约 230MB）到 {SV_ROOT} …", flush=True)
+        subprocess.run(f"curl -sSL --retry 3 '{SV_URL}' | tar xj -C '{SV_ROOT}'", shell=True)
+        hit = glob.glob(os.path.join(SV_ROOT, "*", "model.int8.onnx"))
+    return os.path.dirname(hit[0]) if hit else None
+
+
+def _audio_i16(video):
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", video, "-ac", "1", "-ar", str(SR16),
+                        "-f", "s16le", "-"], capture_output=True)
+    return np.frombuffer(p.stdout, np.int16).astype(np.float32)  # kaldi 习惯：int16 量级
+
+
+def _f0_ac(x):
+    """自相关粗测音高（int16 量级音频）。男声约 80–160Hz，女声约 200–350Hz。"""
+    v = []
+    for i in range(0, len(x) - 1024, 320):
+        fr = x[i:i + 1024] - x[i:i + 1024].mean()
+        if np.sqrt((fr ** 2).mean()) < 600:
+            continue
+        ac = np.correlate(fr, fr, "full")[1023:]
+        k = SR16 // 400 + int(np.argmax(ac[SR16 // 400:SR16 // 70]))
+        if ac[k] > 0.35 * ac[0]:
+            v.append(SR16 / k)
+    return float(np.median(v)) if v else 0.0
+
+
+class SenseVoice:
+    PUNCT = set("，。？！、,.?!")
+
+    def __init__(self, d):
+        import onnxruntime as ort
+        self.s = ort.InferenceSession(os.path.join(d, "model.int8.onnx"), providers=["CPUExecutionProvider"])
+        md = self.s.get_modelmeta().custom_metadata_map
+        self.nm = np.array([float(v) for v in md["neg_mean"].split(",")], np.float32)
+        self.isd = np.array([float(v) for v in md["inv_stddev"].split(",")], np.float32)
+        self.lm, self.ln = int(md.get("lfr_window_size", 7)), int(md.get("lfr_window_shift", 6))
+        self.lang, self.itn = int(md.get("lang_zh", 3)), int(md.get("with_itn", 14))
+        self.tok = {}
+        for line in open(os.path.join(d, "tokens.txt"), encoding="utf-8"):
+            p = line.rstrip("\n").rsplit(" ", 1)
+            if len(p) == 2:
+                self.tok[int(p[1])] = p[0]
+        self.inames = {i.name for i in self.s.get_inputs()}
+        mel = lambda f: 1127.0 * np.log(1 + f / 700.0)
+        a, b = mel(20.0), mel(8000.0); dm = (b - a) / 81
+        mf = mel(np.arange(256) * SR16 / 512)
+        self.fb = np.zeros((80, 257), np.float32)
+        for m in range(80):
+            l, c, r = a + m * dm, a + (m + 1) * dm, a + (m + 2) * dm
+            self.fb[m, :256] = np.maximum(0, np.minimum((mf - l) / (c - l), (r - mf) / (r - c)))
+        self.win = (0.54 - 0.46 * np.cos(2 * np.pi * np.arange(400) / 399)).astype(np.float32)
+
+    def _feats(self, x):
+        if len(x) < 400:
+            x = np.pad(x, (0, 400 - len(x)))
+        n = 1 + (len(x) - 400) // 160
+        fr = np.stack([x[i * 160:i * 160 + 400] for i in range(n)])
+        fr = fr - fr.mean(1, keepdims=True)
+        fr = np.concatenate([fr[:, :1] * 0.03, fr[:, 1:] - 0.97 * fr[:, :-1]], 1) * self.win
+        f = np.log(np.maximum((np.abs(np.fft.rfft(fr, 512)) ** 2) @ self.fb.T, 1.19e-7)).astype(np.float32)
+        T = f.shape[0]
+        f = np.concatenate([np.repeat(f[:1], (self.lm - 1) // 2, 0), f])
+        out = []
+        for i in range(int(np.ceil(T / self.ln))):
+            sl = f[i * self.ln:i * self.ln + self.lm]
+            if sl.shape[0] < self.lm:
+                sl = np.concatenate([sl, np.repeat(f[-1:], self.lm - sl.shape[0], 0)])
+            out.append(sl.reshape(-1))
+        return (np.stack(out) + self.nm) * self.isd
+
+    def tokens(self, x, off=0.0):
+        """[(秒, 字)]，时间来自 CTC 输出帧（每帧 60ms，前 4 帧是语种/情感等标记）。"""
+        if len(x) < SR16 * 0.2:
+            return []
+        ft = self._feats(x)
+        feed = {"x": ft[None].astype(np.float32), "x_length": np.array([ft.shape[0]], np.int32),
+                "language": np.array([self.lang], np.int32), "text_norm": np.array([self.itn], np.int32)}
+        ids = self.s.run(None, {k: v for k, v in feed.items() if k in self.inames})[0][0].argmax(-1)
+        out, prev = [], -1
+        for k, t in enumerate(ids):
+            if t != prev and t != 0:
+                w = self.tok.get(int(t), "")
+                if not w.startswith("<|"):
+                    out.append((off + max(0, k - 4) * self.ln * 0.01, w.replace("▁", " ")))
+            prev = t
+        return out
+
+    def text(self, x):
+        return "".join(w for _, w in self.tokens(x)).strip()
+
+    @staticmethod
+    def _windows(x, maxw=20.0, minw=14.0):
+        hop = int(0.05 * SR16); spans = []; a = 0
+        while a < len(x):
+            if len(x) - a <= maxw * SR16:
+                spans.append((a, len(x))); break
+            lo, hi = a + int(minw * SR16), a + int(maxw * SR16)
+            e = [np.abs(x[i:i + hop]).mean() for i in range(lo, hi - hop, hop)]
+            b = lo + int(np.argmin(e)) * hop + hop // 2
+            spans.append((a, b)); a = b
+        return spans
+
+    def sentences(self, x):
+        """按每个字的时间分小句（逗号/句号处断开，停顿 >0.5 秒也断开），有背景音乐也能切。"""
+        toks = []
+        for a, b in self._windows(x):
+            toks += self.tokens(x[a:b], a / SR16)
+        sents, cur = [], []
+        for t, w in toks:
+            if cur and w not in self.PUNCT and t - cur[-1][0] > 0.5:
+                sents.append(cur); cur = []
+            cur.append((t, w))
+            if w in self.PUNCT:
+                sents.append(cur); cur = []
+        if cur:
+            sents.append(cur)
+        out = []
+        for sg in sents:
+            txt = "".join(w for _, w in sg).strip("，、, ")
+            if txt:
+                a, b = sg[0][0], sg[-1][0] + 0.3
+                f0 = _f0_ac(x[int(a * SR16):int(b * SR16)])
+                out.append({"start": round(a, 2), "end": round(b, 2), "text": txt, "f0": round(f0), "gender": gender_hint(f0)})
+        return out
+
+    def by_cuts(self, x, bounds):
+        out = []
+        for a, b in zip(bounds[:-1], bounds[1:]):
+            seg = x[int(a * SR16):int(b * SR16)]
+            f0 = _f0_ac(seg)
+            out.append({"start": round(a, 2), "end": round(b, 2), "text": self.text(seg), "f0": round(f0), "gender": gender_hint(f0)})
+        return out
+
+
+def _asr_fallback(video, out_dir, a):
+    """SenseVoice 不可用时依次试 faster_whisper / whisper / funasr。"""
+    wav = os.path.join(out_dir, "audio16k.wav")
+    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", video, "-ac", "1", "-ar", "16000", wav])
+    errs = []
     try:
         from faster_whisper import WhisperModel
         m = WhisperModel(a.model, device="auto", compute_type="int8")
         it, _ = m.transcribe(wav, language=a.lang, vad_filter=True, word_timestamps=False)
-        segs = [{"start": round(s.start, 2), "end": round(s.end, 2), "text": s.text.strip()} for s in it]
-        eng = "faster-whisper"
-    except Exception as e1:
+        return [{"start": round(x.start, 2), "end": round(x.end, 2), "text": x.text.strip()} for x in it], "faster-whisper"
+    except Exception as e:
+        errs.append(f"faster_whisper: {type(e).__name__}: {str(e)[:100]}")
+    try:
+        import whisper
+        r = whisper.load_model(a.model).transcribe(wav, language=a.lang)
+        return [{"start": round(x["start"], 2), "end": round(x["end"], 2), "text": x["text"].strip()} for x in r["segments"]], "whisper"
+    except Exception as e:
+        errs.append(f"whisper: {type(e).__name__}: {str(e)[:100]}")
+    try:
+        from funasr import AutoModel
+        r = AutoModel(model="paraformer-zh", vad_model="fsmn-vad", punc_model="ct-punc").generate(input=wav, sentence_timestamp=True)
+        return [{"start": x["start"] / 1000, "end": x["end"] / 1000, "text": x["text"]} for x in r[0].get("sentence_info", [])], "funasr"
+    except Exception as e:
+        errs.append(f"funasr: {type(e).__name__}: {str(e)[:100]}")
+    return None, "\n  ".join(errs)
+
+
+def cmd_asr(a):
+    os.makedirs(a.out_dir, exist_ok=True)
+    segs, eng, err = None, "", ""
+    if a.engine in ("auto", "sensevoice"):
         try:
-            import whisper
-            m = whisper.load_model(a.model)
-            r = m.transcribe(wav, language=a.lang)
-            segs = [{"start": round(s["start"], 2), "end": round(s["end"], 2), "text": s["text"].strip()} for s in r["segments"]]
-            eng = "whisper"
-        except Exception as e2:
-            try:
-                from funasr import AutoModel
-                m = AutoModel(model="paraformer-zh", vad_model="fsmn-vad", punc_model="ct-punc")
-                r = m.generate(input=wav, sentence_timestamp=True)
-                segs = [{"start": s["start"] / 1000, "end": s["end"] / 1000, "text": s["text"]} for s in r[0].get("sentence_info", [])]
-                eng = "funasr"
-            except Exception as e3:
-                print("ASR 不可用：本环境装不上或下载不了语音识别模型。"
-                      f"\n  faster_whisper: {type(e1).__name__}: {str(e1)[:120]}"
-                      f"\n  whisper: {type(e2).__name__}: {str(e2)[:120]}"
-                      f"\n  funasr: {type(e3).__name__}: {str(e3)[:120]}"
-                      "\n→ 有烧录字幕就读字幕；没有字幕就请用户提供台词文本/SRT，或只反推画面与动作。")
-                sys.exit(2)
+            d = _sv_dir()
+            if not d:
+                raise RuntimeError("模型下载失败（GitHub 访问不了？）")
+            sv = SenseVoice(d)
+            x = _audio_i16(a.video)
+            if a.cuts:
+                b = [float(c) for c in a.cuts.split(",")]
+                dur = len(x) / SR16
+                if b[0] > 0: b = [0.0] + b
+                if b[-1] < dur - 0.05: b.append(dur)
+                segs = sv.by_cuts(x, b)
+            else:
+                segs = sv.sentences(x)
+            eng = "sensevoice"
+        except Exception as e:
+            err = f"sensevoice: {type(e).__name__}: {str(e)[:160]}"
+    if segs is None and a.engine != "sensevoice":
+        segs, eng2 = _asr_fallback(a.video, a.out_dir, a)
+        if segs is None:
+            err = (err + "\n  " + eng2).strip()
+        else:
+            eng = eng2
+    if segs is None:
+        print("ASR 不可用：\n  " + err + "\n→ 有烧录字幕就读字幕；没有字幕就请用户提供台词文本/SRT。")
+        sys.exit(2)
     p = os.path.join(a.out_dir, "asr.json")
     with open(p, "w", encoding="utf-8") as f:
         json.dump({"engine": eng, "segments": segs}, f, ensure_ascii=False, indent=1)
-    for s in segs:
-        print(f"{s['start']:7.2f}-{s['end']:7.2f}  {s['text']}")
-    print(f"→ {p}（引擎 {eng}；同音字/专有名词仍需对照画面与上下文校正）")
+    lines = [f"{x['start']:7.2f}-{x['end']:7.2f}  {str(x.get('f0', '')) + 'Hz' if x.get('f0') else '   -  ':>6} "
+             f"{x.get('gender', ''):1}  {x['text']}" for x in segs]
+    open(os.path.join(a.out_dir, "asr.txt"), "w", encoding="utf-8").write("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    print(f"→ {p}（引擎 {eng}；男约 80–160Hz、女约 200–350Hz；同音字/人名按字幕和剧情校正）")
+
+
+def _sim(exp, got):
+    """剧本台词有多少字在转写里按顺序出现（0–1）。"""
+    from difflib import SequenceMatcher
+    a, b = _norm(exp), _norm(got)
+    if not a:
+        return 1.0
+    return sum(m.size for m in SequenceMatcher(None, a, b, autojunk=False).get_matching_blocks()) / len(a)
+
+
+def cmd_check(a):
+    """成片核对：用户按剧本生成的成片，逐镜头比时长、逐句比台词和男女声。"""
+    os.makedirs(a.out, exist_ok=True)
+    dur = probe(a.clip)["duration"]
+    cuts = [c for c in scene_cuts(a.clip, 0.2) if 0.4 < c < dur - 0.4]
+    bounds = [0.0] + cuts + [dur]
+    d = _sv_dir()
+    if not d:
+        sys.exit("语音识别模型下载失败，无法核对台词")
+    sv = SenseVoice(d)
+    x = _audio_i16(a.clip)
+    det = sv.by_cuts(x, bounds)
+    rows = [f"# 成片核对：{os.path.basename(a.clip)}（{dur:.1f} 秒，检测到 {len(det)} 个镜头）", "",
+            f"全片转写：{sv.text(x)}", "", "## 镜头与声音", "", "| 成片镜头 | 时间 | 时长 | 声音 | 转写 |", "|---|---|---|---|---|"]
+    rows += [f"| {i} | {c['start']:.1f}–{c['end']:.1f} | {c['end'] - c['start']:.1f}s | {c['gender'] or '?'}（{c['f0'] or '-'}Hz） | {c['text']} |"
+             for i, c in enumerate(det, 1)]
+    bad = 0
+    if a.spec:
+        sp = _load_spec(a.spec)
+        sg = sp["segments"][a.seg - 1]
+        exp = [float(s_["t"]) for s_ in sg["shots"]]
+        rows += ["", f"## 镜头时长（剧本分镜{a.seg}：{len(exp)} 个镜头，成片 {len(det)} 个）", "",
+                 "| 镜头 | 剧本时长 | 成片时长 | 结果 |", "|---|---|---|---|"]
+        for i in range(max(len(exp), len(det))):
+            e = exp[i] if i < len(exp) else None
+            g = (det[i]["end"] - det[i]["start"]) if i < len(det) else None
+            ok = e is not None and g is not None and abs(e - g) <= max(0.6, 0.35 * e)
+            bad += 0 if ok else 1
+            rows.append(f"| {i + 1} | {'' if e is None else f'{e:.1f}s'} | {'' if g is None else f'{g:.1f}s'} | {'✓' if ok else '✗ 被压缩/拉长或镜头数不对'} |")
+        rows += ["", "## 台词（按顺序在成片转写里找）", "", "| 剧本镜头 | 说话人（应为） | 剧本台词 | 成片里对应的话 | 在成片镜头 | 实际声音 | 结果 |",
+                 "|---|---|---|---|---|---|---|"]
+        T, owner = "", []
+        for i, c in enumerate(det):
+            nt = _norm(c["text"]); T += nt; owner += [i] * len(nt)
+        cur = 0
+        for k, s_ in enumerate(sg["shots"], 1):
+            for ln in s_.get("lines", []):
+                who, vk, txt, _, _ = _line(ln)
+                want = _gender_of(who, vk, sp, sg)
+                e = _norm(txt)
+                best, bp, bl = 0.0, -1, 0
+                for p_ in range(cur, max(cur, len(T) - max(1, len(e) // 2)) + 1):
+                    for L_ in {len(e), len(e) + 2, max(1, len(e) - 2)}:
+                        r = _sim(e, T[p_:p_ + L_])
+                        if r > best + 1e-9:
+                            best, bp, bl = r, p_, L_
+                if best >= 0.6 and bp >= 0:
+                    span = owner[bp:bp + bl] or [owner[min(bp, len(owner) - 1)]]
+                    idx = sorted(set(span))
+                    gs = [det[i]["gender"] for i in idx if det[i]["gender"] in ("男", "女")]
+                    g = max(set(gs), key=gs.count) if gs else "?"
+                    got, where = T[bp:bp + bl], "、".join(str(i + 1) for i in idx)
+                    cur = bp + bl
+                    res = "✓" if want == "?" or g in ("?", want) else f"✗ 声音不对：{g}声念了{want}声的台词（串位）"
+                else:
+                    g, got, where = "-", "（没找到）", "-"
+                    res = "✗ 没念出来或念错" + ("（尖叫/语气词识别不了，看画面确认）" if len(e) <= 2 else "")
+                bad += 0 if res == "✓" else 1
+                rows.append(f"| {k} | {who}（{want}） | {txt} | {got} | {where} | {g} | {res} |")
+    sheet = os.path.join(a.out, "check_%02d.png")
+    run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", a.clip, "-vf",
+         "fps=2,scale=384:-2,drawtext=text='%{pts\\:flt}':x=4:y=4:fontsize=20:fontcolor=yellow:box=1:boxcolor=black,tile=5x4", sheet])
+    rows += ["", f"画面拼图：{a.out}/check_XX.png（每秒 2 帧，查脸、服装、多出来的字）"]
+    p = os.path.join(a.out, "check.md")
+    open(p, "w", encoding="utf-8").write("\n".join(rows) + "\n")
+    print("\n".join(rows))
+    print(f"\n→ {p}；{'有 ' + str(bad) + ' 处 ✗' if bad else '台词和时长都对上了'}")
 
 
 # ---------- 剧本渲染 + 自动检查 ----------
@@ -581,6 +839,24 @@ def _line(ln):
     if len(ln) >= 3:
         return ln[0], ln[1] or "", ln[2], (ln[3] if len(ln) >= 4 else "") or "", ""
     return ln[0], "", ln[1], "", ""
+
+
+def _base(who):
+    return re.sub(r"[（(].*?[)）]", "", who)
+
+
+def _gender_of(who, vk, sp, sg=None):
+    """男/女/?：先看说话类型，再看本段 voices、全局 voices、角色 voice。"""
+    ch = (sp.get("characters") or {}).get(who) or {}
+    srcs = [vk, ((sg or {}).get("voices") or {}).get(who, ""), (sp.get("voices") or {}).get(who, ""),
+            ch.get("voice", "") if isinstance(ch, dict) else ""]
+    for t in srcs:
+        t = str(t or "")
+        if re.search(r"男声|男音|少年音|男低音|男中音", t):
+            return "男"
+        if re.search(r"女声|女音|少女音|御姐音|萝莉音", t):
+            return "女"
+    return "?"
 
 
 # ---------- 起名：每次随机给候选，避开用过的名字和 AI 爱用的烂大街名字 ----------
@@ -688,6 +964,10 @@ def cmd_render(a):
                 warns.append(f"分镜{n}: 参考图放了 {r}，但本段 cast 里没有（不出镜的人别放图）")
             elif r not in chars and r not in seg_text:
                 warns.append(f"分镜{n}: 参考图「{r}」在本段画面描述里没用到（多放图会被模型硬塞进画面）")
+        max_shots = int(L * 7 / 15 + 0.5)
+        if len(shots) > max_shots:
+            warns.append(f"分镜{n}: {len(shots)} 个镜头，{L:g} 秒最多 {max_shots} 个（多了模型会自己压缩某几个镜头，台词被截断），合并没台词的反应镜头")
+        seen_lines, seg_beats = {}, []
         o = [f"# 分镜{n}｜预计时长：{_fmt(L)}秒｜全片时间：{t_global:g}—{t_global + L:g}秒", "",
              f"**本段参考图：{'、'.join(refs)}**", f"**镜头数量：{len(shots)}个**", f"**剧情范围：**{sg['range']}", "",
              (f"{prefix}，" if prefix else "") + "画面纯净，全程无任何字幕、文字和水印。" + f"生成一段{_fmt(L)}秒的高质量{aspect}{orient}{kind}视频，{texture}，超清画质，稳定人物建模、服装、材质和场景资产，"
@@ -723,6 +1003,11 @@ def cmd_render(a):
             d = float(s["t"])
             if d < 1.2:
                 warns.append(f"分镜{n} 镜头{k}: 只有 {d}s，可能被模型吞掉")
+            visual = str(s.get("cam", "")) + str(s.get("frame", "")) + str(s.get("action", ""))
+            if re.search(r"闪白|溶解|叠化|甩镜|黑场|划像|转场特效", visual):
+                warns.append(f"分镜{n} 镜头{k}: 写了转场特效（闪白/溶解/甩镜…），模型做不出来只会挤占时长，直接切")
+            if s.get("beat"):
+                seg_beats.append(f"镜头{k}{s['beat']}")
             o.append(f"### 镜头{k}：[{_fmt(t)}—{_fmt(t + d)}秒][{s['cam']}]")
             o.append("")
             if s.get("frame"):
@@ -742,7 +1027,24 @@ def cmd_render(a):
                 who, vk, txt, why, orig = _line(ln)
                 filled = bool(why)  # 补写依据：原片读不出来、AI 按剧情补的台词
                 tag = (vk if "（" in vk else f"（{vk}）") if vk else ""  # 自带括号的类型（如 手机打字（画外音朗读，嘴不动））直接接在名字后
-                o += [f"台词（只出声音，不显示成字幕）：{who}{tag}：“{txt}”", ""]  # 剧本里不加标记，免得模型把标记当文字生成
+                g = _gender_of(who, vk, sp, sg)
+                gtag = f"（{g}声）" if g != "?" and not re.search("男声|女声", vk) else ""
+                o += [f"台词（只出声音，不显示成字幕）：{who}{gtag}{tag}：“{txt}”", ""]  # 剧本里不加标记，免得模型把标记当文字生成
+                if g == "?":
+                    warns.append(f"分镜{n} 镜头{k}: {who} 这句分不出男声女声——在说话类型或角色 voice 里写明“男声/女声”，模型才不会把台词安给别人")
+                offscreen_ok = any(x_ in vk for x_ in ("内心", "电话", "听筒", "广播", "手机", "朗读", "旁白", "喇叭", "对讲"))
+                if not offscreen_ok:
+                    if any(x_ in vk for x_ in ("画外", "不在画面", "人不在", "只拍到")):
+                        warns.append(f"分镜{n} 镜头{k}: {who} 的台词写成了画外/不在画面里——模型会把这句串给画面里张嘴的人、原句被吞。"
+                                     f"让{_base(who)}入画开口说（双人镜头，或前景道具、焦点移到{_base(who)}脸上），道具特写拆成不带台词的插入镜头")
+                    elif who in chars and _base(who) not in visual and not re.search(r"两人|双人|二人|三人|众人|全员|所有人", visual):
+                        warns.append(f"分镜{n} 镜头{k}: {who} 在说话，但这个镜头的运镜/动作里没写到{_base(who)}——说话人要在画面里、看得到嘴")
+                kk = _norm(txt)
+                if len(kk) > 2:
+                    if kk in seen_lines:
+                        warns.append(f"分镜{n}: 「{txt}」在本段出现两次（镜头{seen_lines[kk]}、镜头{k}），模型容易把台词对错镜头，第二次换个说法")
+                    else:
+                        seen_lines[kk] = k
                 nchar += len(_norm(txt))
                 if filled:
                     filled_lines.append((n, k, t, who, txt, str(why)))
@@ -761,13 +1063,20 @@ def cmd_render(a):
             if nchar and nchar / d > 6.2:
                 warns.append(f"分镜{n} 镜头{k}: 语速 {nchar / d:.1f} 字/秒（{nchar}字/{d}s），超过 6")
             t += d
+        if sp.get("viral", bool(sp.get("adapt"))):
+            if not seg_beats:
+                warns.append(f"分镜{n}: 没标爆点——每段至少一个（镜头里写 beat: 钩子/反转/笑点/心动/爽点/悬念）")
+            if n == 1 and "钩子" not in str(shots[0].get("beat", "")):
+                warns.append("分镜1 镜头1 没标“钩子”：开头 3 秒必须是全集最抓人的画面或台词（冲突、反转、金句、颜值暴击）")
+            if n == len(sp["segments"]) and not re.search("钩子|悬念|反转", str(shots[-1].get("beat", ""))):
+                warns.append(f"分镜{n}（最后一段）最后一个镜头没标“悬念/钩子”：全集要停在让人想看下一集的地方")
         if sg.get("tail"):
             o += [f"段尾承接：{sg['tail']}", ""]
         o.append("片段约束：")
         for c in sg.get("constraints", []) + std_cons:
             o.append(f"- {c}")
         out.append("\n".join(o))
-        overview.append((n, t_global, t_global + L, L, len(shots), refs, sg["range"]))
+        overview.append((n, t_global, t_global + L, L, len(shots), refs, sg["range"], "；".join(seg_beats)))
         t_global += L
     text = "\n\n---\n\n".join(out)
     if design:
@@ -781,8 +1090,8 @@ def cmd_render(a):
           f"- 分镜：{len(overview)}段（每段时长：{'、'.join(l + '秒' for l in lens)}），镜头合计 {sum(r[4] for r in overview)} 个",
           f"- 需要的参考图：{len(all_refs)}张（{'、'.join(all_refs)}）",
           "- 用法：先生成参考图，再每次复制一段分镜、带上该段的参考图去生成视频，一次只贴一段。", "",
-          "| 分镜 | 全片时间 | 时长 | 镜头 | 本段参考图 | 剧情 |", "|---|---|---|---|---|---|"]
-    ov += [f"| 分镜{n} | {a0:g}—{a1:g}秒 | {L:g}秒 | {k} | {'、'.join(r)} | {rg} |" for n, a0, a1, L, k, r, rg in overview]
+          "| 分镜 | 全片时间 | 时长 | 镜头 | 本段参考图 | 剧情 | 爆点 |", "|---|---|---|---|---|---|---|"]
+    ov += [f"| 分镜{n} | {a0:g}—{a1:g}秒 | {L:g}秒 | {k} | {'、'.join(r)} | {rg} | {bt} |" for n, a0, a1, L, k, r, rg, bt in overview]
     text = "\n".join(ov) + "\n\n---\n\n" + text
     if sp.get("global_rules"):
         text += "\n\n---\n\n# 全片统一生成规则\n\n" + sp["global_rules"].strip()
@@ -790,7 +1099,7 @@ def cmd_render(a):
     # 改编检查：原片的人名、地名、标志性道具不能残留在剧本里
     if sp.get("adapt"):
         used = _used_names(sp.get("title"))
-        for nm in list(chars) + list((sp.get("voices") or {}).keys()):
+        for nm in dict.fromkeys(_base(x) for x in list(chars) + list((sp.get("voices") or {}).keys())):
             if nm in used:
                 warns.append(f"角色名「{nm}」以前的剧用过了，换一个（vid2script.py names 出候选）")
             elif len(nm) >= 2 and (nm[1:] in CLICHE or (nm[0] in CLICHE_SURN and len(nm) >= 3)):
@@ -822,7 +1131,7 @@ def cmd_render(a):
             cnt = flat.count(ns)
             if cnt == 0:
                 warns.append(f"台词缺失：「{s}」不在剧本里")
-            elif cnt > 1 and len(ns) > 2 and sum(1 for x in subs if _norm(x) == ns) < cnt:
+            elif cnt > 1 and len(ns) > 2 and sum(1 for x in subs if ns in _norm(x)) < cnt:
                 warns.append(f"台词重复：「{s}」出现 {cnt} 次")
             p = flat.find(ns, max(pos_prev, 0))
             if p == -1 and cnt:
@@ -841,13 +1150,17 @@ def cmd_render(a):
         rows += [f"| 分镜{n} 镜头{k}（{tt:.1f}秒起） | {who} | {txt} | {why} |" for n, k, tt, who, txt, why in filled_lines]
         open(rep, "w", encoding="utf-8").write("\n".join(rows) + "\n")
         print(f"AI 补写台词 {len(filled_lines)} 句（占 {ratio:.0%}），清单：{rep}")
+    if sp.get("package"):
+        rep_p = os.path.splitext(a.out)[0] + "_爆款包装.md"
+        open(rep_p, "w", encoding="utf-8").write("# 爆款包装（标题 / 封面 / 标签，发布时用，不要贴进视频模型）\n\n" + str(sp["package"]).strip() + "\n")
+        print(f"爆款包装：{rep_p}")
     print(f"已生成 {a.out}：{len(sp['segments'])} 段，合计 {t_global - float(sp.get('start', 0)):g} 秒，{len(text)} 字")
     if warns:
         print(f"⚠ {len(warns)} 条问题：")
         for w in warns:
             print("  -", w)
     else:
-        print("✓ 自动检查全部通过（时间轴、语速、画面描述长度、参考图及提示词、白名单、画外音嘴型、台词覆盖与补写、改编残留）")
+        print("✓ 自动检查全部通过（时间轴、语速、镜头数、画面描述长度、参考图及提示词、白名单、说话人在画面里、男女声、重复台词、转场、爆点钩子、画外音嘴型、台词覆盖与补写、改编残留）")
 
 
 def main():
@@ -864,9 +1177,16 @@ def main():
     p = sp.add_parser("pitch"); p.add_argument("video"); p.add_argument("start", type=float); p.add_argument("end", type=float)
     p.add_argument("--analysis", help="analyze 生成的 analysis.json，用它的字幕时段排除人声后估噪声（更准）")
     p.set_defaults(f=cmd_pitch)
-    p = sp.add_parser("asr"); p.add_argument("video"); p.add_argument("out_dir")
-    p.add_argument("--model", default="small"); p.add_argument("--lang", default="zh")
+    p = sp.add_parser("asr", help="语音转写（SenseVoice，自动下载模型）")
+    p.add_argument("video"); p.add_argument("out_dir")
+    p.add_argument("--cuts", help="按镜头切点逐段转写，如 0,2.5,5.4（核对成片用）")
+    p.add_argument("--engine", default="auto", choices=["auto", "sensevoice", "fallback"])
+    p.add_argument("--model", default="small", help="备用 whisper 的模型大小"); p.add_argument("--lang", default="zh")
     p.set_defaults(f=cmd_asr)
+    p = sp.add_parser("check", help="成片核对：镜头时长、逐句台词和男女声对照剧本")
+    p.add_argument("clip"); p.add_argument("out")
+    p.add_argument("--spec", help="剧本数据 spec.yaml / spec.json"); p.add_argument("--seg", type=int, default=1, help="这条成片是第几段分镜")
+    p.set_defaults(f=cmd_check)
     p = sp.add_parser("names", help="随机给一批候选名字（避开用过的）；--add 把选定的名字记进用过的名单")
     p.add_argument("-n", type=int, default=12); p.add_argument("--add", nargs="*")
     p.add_argument("--title", default="", help="剧名；--add 时一起记下，本剧以后重新 render 不会把自己的名字当撞名")
