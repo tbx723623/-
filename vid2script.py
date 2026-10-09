@@ -650,6 +650,20 @@ def cmd_render(a):
     prefix = str(sp.get("prefix") or "").strip().rstrip("，,。")  # 用户的生图/生视频风格前缀，放在每段和每条参考图提示词最前面
     white = set(sp.get("whitelist", []))
     std_cons = sp.get("std_constraints", ["不生成任何字幕或说明文字。", "参考图中的文字、标签、三视图边框不得出现在画面中。"])
+    # —— 起名查重：avoid=以前各部剧用过的名字；另外查 AI 起名最爱用的那批名，免得和别的剧撞 ——
+    CLICHE = set("叙白 知夏 砚之 时雨 屿川 以宁 京泽 梦瑶 清欢 景深 宴辞 霁川 星辞 念安 知意 南乔 晚晚 念念 景行 言之 承泽 司宴 "
+                 "时宴 予安 温言 慕白 子衿 听雨 南栀 清禾 知予 淮安 怀瑾 书意 清晏 沉舟 予白 晏清".split())
+    new_names = [n for n in list(chars) + list((sp.get("voices") or {}).keys()) + list((sp.get("rename") or {}).values())
+                 if isinstance(n, str) and 2 <= len(n) <= 4 and n not in ("背景",)]
+    avoid = [a for a in (sp.get("avoid") or []) if isinstance(a, str) and a]
+    for nm in dict.fromkeys(new_names):
+        for a in avoid:
+            if nm == a:
+                warns_pre.append(f"起名：{nm} 以前的剧用过，换一个")
+            elif len(nm) >= 3 and len(a) >= 3 and nm[1:] == a[1:]:
+                warns_pre.append(f"起名：{nm} 和以前用过的 {a} 只差一个姓，换一个")
+        if len(nm) >= 3 and nm[1:] in CLICHE:
+            warns_pre.append(f"起名：{nm} 的「{nm[1:]}」是 AI 最常起的名，很容易和别的剧撞，换个少见点的")
     warns, out = list(warns_pre), []
     t_global = float(sp.get("start", 0))
     all_lines, filled_lines, adapt_lines = [], [], []
